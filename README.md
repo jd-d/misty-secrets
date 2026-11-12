@@ -11,7 +11,11 @@ A static flavour recipe lab, mixing calculator and tasting journal.
 
 The complete website lives in `dist/`. It uses plain HTML, CSS and JavaScript, with locally hosted artwork. There is no package installation or compilation step.
 
-Push changes to `main` to validate the calculator and deploy `dist/` using the official GitHub Pages Actions. Enable **Settings > Pages > Source > GitHub Actions** once for this repository.
+Pushes to `main` run the calculator checks, then publish `dist/` to the root of the `gh-pages` branch.
+
+Each pull request from this repository is also published as a preview at `https://jd-d.github.io/misty-secrets/previews/pr-<number>/`. A bot comment on the PR links to it and is updated on every push. The preview is removed when the PR is merged or closed. Pull requests from forks are validated but not previewed, because their code must not run with a write token.
+
+One-time setup: after the first deployment to `main` creates the `gh-pages` branch, set **Settings > Pages > Source > Deploy from a branch > `gh-pages` / (root)**.
 
 Run the checks with Node.js:
 
@@ -33,4 +37,4 @@ Initially copied from the deployed Misty Secrets site, version 15, source commit
 
 This is an independent copy. Changes made to the original Sites deployment do not automatically sync here, and changes here do not automatically update the original host.
 
-The earlier website template was reviewed. Its production deployment concept was retained, using a smaller official Pages workflow. PR preview publishing, a generated `gh-pages` branch and PWA placeholders were omitted because this site does not require them.
+PR preview publishing follows the approach in `jd-d/website-template-include-ALL-branches`, adapted to use the `pull_request` event, a single updating PR comment and a deployment check against the exact commit.

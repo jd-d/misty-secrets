@@ -1,24 +1,33 @@
-name: Validate and deploy GitHub Pages
+name: Validate, deploy and preview
+
+# Production: pushes to main publish dist/ to the root of the gh-pages branch.
+# Previews:   pull requests from this repository publish to gh-pages/previews/pr-<number>/
+#             and keep one bot comment on the PR up to date with the link.
+# Pages must serve from: Settings > Pages > Source > Deploy from a branch > gh-pages / (root).
+#
+# This uses `pull_request`, not `pull_request_target`: the PR's own code (calculator checks)
+# runs here, so it must never receive a write token for fork PRs. Fork PRs are validated only.
 
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
+    types: [opened, synchronize, reopened]
   workflow_dispatch:
+
+concurrency:
+  group: pages-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
-
-concurrency:
-  group: pages-${{ github.ref }}
-  cancel-in-progress: true
 
 jobs:
   validate:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -28,27 +37,169 @@ jobs:
           node check-balance.cjs
           node check-strengths.cjs
       - name: Check JavaScript syntax
-        run: |
-          for file in dist/*.js; do node --check "$file"; done
-      - name: Upload website
-        if: github.event_name != 'pull_request'
-        uses: actions/upload-pages-artifact@v4
+        run: for file in dist/*.js; do node --check "$file"; done
+      - name: Upload site
+        uses: actions/upload-artifact@v4
         with:
+          name: site
           path: dist
+          include-hidden-files: true
+          retention-days: 3
 
-  deploy:
-    if: github.event_name != 'pull_request'
+  publish:
     needs: validate
+    # Skip fork PRs: their token is read-only and their code is untrusted.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     permissions:
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+      contents: write
+      pull-requests: write
+      issues: write
+    env:
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
-      - name: Configure Pages
-        uses: actions/configure-pages@v5
-      - name: Deploy website
-        id: deployment
-        uses: actions/deploy-pages@v4
+      - name: Work out destination
+        id: dest
+        run: |
+          base="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}"
+          if [ -n "$PR_NUMBER" ]; then
+            echo "dir=previews/pr-$PR_NUMBER" >> "$GITHUB_OUTPUT"
+            echo "url=$base/previews/pr-$PR_NUMBER/" >> "$GITHUB_OUTPUT"
+          else
+            echo "dir=." >> "$GITHUB_OUTPUT"
+            echo "url=$base/" >> "$GITHUB_OUTPUT"
+          fi
+          echo "short=${HEAD_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Mark preview as deploying
+        if: env.PR_NUMBER != ''
+        id: comment
+        uses: actions/github-script@v7
+        env:
+          URL: ${{ steps.dest.outputs.url }}
+          SHORT: ${{ steps.dest.outputs.short }}
+        with:
+          script: |
+            const marker = '<!-- misty-pr-preview -->';
+            const body = `${marker}\n⏳ **Preview deploying** for \`${process.env.SHORT}\`…\n\nIt will appear at ${process.env.URL}`;
+            const comments = await github.paginate(github.rest.issues.listComments, { ...context.repo, issue_number: Number(process.env.PR_NUMBER), per_page: 100 });
+            const existing = comments.find(c => c.user?.type === 'Bot' && c.body?.includes(marker));
+            const res = existing
+              ? await github.rest.issues.updateComment({ ...context.repo, comment_id: existing.id, body })
+              : await github.rest.issues.createComment({ ...context.repo, issue_number: Number(process.env.PR_NUMBER), body });
+            core.setOutput('id', String(res.data.id));
+
+      - name: Download site
+        uses: actions/download-artifact@v4
+        with:
+          name: site
+          path: site
+
+      - name: Publish to gh-pages
+        env:
+          DIR: ${{ steps.dest.outputs.dir }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "$HEAD_SHA" > site/preview-version.txt
+          remote="https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          attempt() {
+            rm -rf pages && git init -q pages && cd pages || return 1
+            git remote add origin "$remote" || return 1
+            if git ls-remote --exit-code --heads origin gh-pages >/dev/null; then
+              git fetch -q --depth 1 origin gh-pages && git checkout -q -b gh-pages FETCH_HEAD || return 1
+            else
+              echo "gh-pages does not exist yet; creating it."
+              git checkout -q --orphan gh-pages
+            fi
+            if [ "$DIR" = "." ]; then
+              # Production: replace everything except PR previews.
+              rsync -a --delete --exclude '/previews/' --exclude '/.git/' ../site/ ./ || return 1
+            else
+              mkdir -p "$DIR" && rsync -a --delete ../site/ "$DIR/" || return 1
+            fi
+            touch .nojekyll
+            git add -A || return 1
+            if git diff --cached --quiet; then echo "Nothing changed."; cd ..; return 0; fi
+            git commit -q -m "Deploy ${DIR/#./production} from ${HEAD_SHA::7}" || return 1
+            git push -q origin gh-pages
+            local rc=$?; cd ..; return $rc
+          }
+
+          # Previews and production share one branch; rebuild and retry if a parallel run pushed first.
+          for i in 1 2 3 4 5; do
+            if attempt; then exit 0; fi
+            cd "$GITHUB_WORKSPACE"; echo "Push rejected, retrying ($i)…"; sleep $((i * 3))
+          done
+          echo "Could not publish after 5 attempts." && exit 1
+
+      - name: Wait for GitHub Pages
+        id: wait
+        uses: actions/github-script@v7
+        env:
+          URL: ${{ steps.dest.outputs.url }}
+        with:
+          script: |
+            const url = process.env.URL, sha = process.env.HEAD_SHA;
+            for (let i = 1; i <= 40; i++) {
+              try {
+                const res = await fetch(`${url}preview-version.txt?t=${Date.now()}`, { cache: 'no-store' });
+                if (res.ok && (await res.text()).trim() === sha) { core.info(`Live after ${i} checks.`); core.setOutput('live', 'true'); return; }
+              } catch (e) { core.info(e.message); }
+              await new Promise(r => setTimeout(r, 6000));
+            }
+            core.warning('Published, but Pages had not served this commit yet. Check that Pages serves from the gh-pages branch.');
+            core.setOutput('live', 'false');
+
+      - name: Update preview comment
+        if: always() && steps.comment.outputs.id
+        uses: actions/github-script@v7
+        env:
+          ID: ${{ steps.comment.outputs.id }}
+          URL: ${{ steps.dest.outputs.url }}
+          SHORT: ${{ steps.dest.outputs.short }}
+          LIVE: ${{ steps.wait.outputs.live }}
+          OUTCOME: ${{ job.status }}
+        with:
+          script: |
+            const { URL: url, SHORT: short, LIVE: live, OUTCOME: outcome } = process.env;
+            const run = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const line = outcome !== 'success'
+              ? `❌ **Preview failed** for \`${short}\`. [See the run](${run}).`
+              : live === 'true'
+                ? `🔍 **Preview ready** for \`${short}\`: ${url}`
+                : `⚠️ **Preview published** for \`${short}\` but not live yet. Try ${url} in a minute. If it never appears, check Settings › Pages serves from \`gh-pages\`.`;
+            await github.rest.issues.updateComment({ ...context.repo, comment_id: Number(process.env.ID), body: `<!-- misty-pr-preview -->\n${line}\n\n<sub>Updated on every push to this PR · removed when the PR closes</sub>` });
+
+  # Validation failed: publishing is skipped, so say so on the PR instead of leaving
+  # an older "ready" comment pointing at a preview of a previous commit.
+  report-failure:
+    needs: validate
+    if: failure() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          SHORT: ${{ github.event.pull_request.head.sha }}
+        with:
+          script: |
+            const marker = '<!-- misty-pr-preview -->';
+            const short = process.env.SHORT.slice(0, 7);
+            const issue_number = Number(process.env.PR_NUMBER);
+            const run = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const comments = await github.paginate(github.rest.issues.listComments, { ...context.repo, issue_number, per_page: 100 });
+            const existing = comments.find(c => c.user?.type === 'Bot' && c.body?.includes(marker));
+            const hadPreview = existing && /Preview (ready|published)/.test(existing.body);
+            const body = `${marker}\n❌ **Checks failed** for \`${short}\`, so it was not previewed. [See the run](${run}).` +
+              (hadPreview ? `\n\nThe preview link still shows an **older commit**.` : '') +
+              `\n\n<sub>Updated on every push to this PR · removed when the PR closes</sub>`;
+            if (existing) await github.rest.issues.updateComment({ ...context.repo, comment_id: existing.id, body });
+            else await github.rest.issues.createComment({ ...context.repo, issue_number, body });
