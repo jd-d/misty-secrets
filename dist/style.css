@@ -128,6 +128,7 @@ main.entering>*{animation:rise .45s var(--ease) both}
 .footer-brand{display:flex;align-items:baseline;gap:18px;flex-wrap:wrap}
 .footer-brand .brand{font-size:21px;gap:0}
 .footer-tag,.footer-note{font-size:13px;color:var(--muted)}
+.build-id{font:500 11px var(--mono);color:var(--faint);letter-spacing:-.01em}
 .footer-actions{display:flex;align-items:center;gap:20px;flex-wrap:wrap}
 
 .tab-bar,.result-dock{display:none}
