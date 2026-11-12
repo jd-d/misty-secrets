@@ -105,6 +105,10 @@ jobs:
         run: |
           set -euo pipefail
           echo "$HEAD_SHA" > site/preview-version.txt
+          # Cache-bust: stamp the commit into asset URLs and the footer build ID.
+          short="${HEAD_SHA::7}"
+          sed -i -e "s/?v=dev\"/?v=${short}\"/g" -e "s/content=\"dev\"/content=\"${short}\"/" -e "s/>build dev</>build ${short}</" site/index.html
+          grep -q "?v=${short}" site/index.html || { echo "Cache-bust stamping failed"; exit 1; }
           remote="https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
