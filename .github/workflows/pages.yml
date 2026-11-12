@@ -174,3 +174,32 @@ jobs:
                 ? `🔍 **Preview ready** for \`${short}\`: ${url}`
                 : `⚠️ **Preview published** for \`${short}\` but not live yet. Try ${url} in a minute. If it never appears, check Settings › Pages serves from \`gh-pages\`.`;
             await github.rest.issues.updateComment({ ...context.repo, comment_id: Number(process.env.ID), body: `<!-- misty-pr-preview -->\n${line}\n\n<sub>Updated on every push to this PR · removed when the PR closes</sub>` });
+
+  # Validation failed: publishing is skipped, so say so on the PR instead of leaving
+  # an older "ready" comment pointing at a preview of a previous commit.
+  report-failure:
+    needs: validate
+    if: failure() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          SHORT: ${{ github.event.pull_request.head.sha }}
+        with:
+          script: |
+            const marker = '<!-- misty-pr-preview -->';
+            const short = process.env.SHORT.slice(0, 7);
+            const issue_number = Number(process.env.PR_NUMBER);
+            const run = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const comments = await github.paginate(github.rest.issues.listComments, { ...context.repo, issue_number, per_page: 100 });
+            const existing = comments.find(c => c.user?.type === 'Bot' && c.body?.includes(marker));
+            const hadPreview = existing && /Preview (ready|published)/.test(existing.body);
+            const body = `${marker}\n❌ **Checks failed** for \`${short}\`, so it was not previewed. [See the run](${run}).` +
+              (hadPreview ? `\n\nThe preview link still shows an **older commit**.` : '') +
+              `\n\n<sub>Updated on every push to this PR · removed when the PR closes</sub>`;
+            if (existing) await github.rest.issues.updateComment({ ...context.repo, comment_id: existing.id, body });
+            else await github.rest.issues.createComment({ ...context.repo, issue_number, body });
